@@ -1,1 +1,56 @@
+/* ================================================================
+ *  RECEIVER / CAN BRIDGE — Arduino Uno
+ *  Hardware : Uno + nRF24L01 (RX) + MCP2515 (CAN TX)
+ *  UNCHANGED from original system
+ *
+ *  nRF24L01 : CE=D9,  CSN=D10
+ *  MCP2515   : CS=D8  (shared SPI D11/D12/D13)
+ *  Sends CAN ID 0x100 — joystick data to STM32
+ * ================================================================ */
 
+#include <SPI.h>
+#include <RF24.h>
+#include <mcp_can.h>
+
+RF24    radio(9, 10);
+MCP_CAN CAN(8);
+
+const byte ADDR[6] = "MOTOR";
+const long CAN_ID  = 0x100;
+
+struct JoyData { uint16_t x; uint16_t y; };
+
+void setup() {
+  Serial.begin(9600);
+  if (!radio.begin()) {
+    Serial.println("ERROR: nRF24L01 not detected!");
+    while (true);
+  }
+  radio.setChannel(76);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.openReadingPipe(0, ADDR);
+  radio.startListening();
+  Serial.println("nRF24L01 ready (RX mode)");
+
+  while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+    Serial.println("MCP2515 init failed – check wiring / crystal freq.");
+    delay(300);
+  }
+  CAN.setMode(MCP_NORMAL);
+  Serial.println("MCP2515 CAN ready (TX node)");
+}
+
+void loop() {
+  if (!radio.available()) return;
+  JoyData data;
+  radio.read(&data, sizeof(data));
+  byte buf[4] = {
+    (byte)(data.x >> 8), (byte)(data.x & 0xFF),
+    (byte)(data.y >> 8), (byte)(data.y & 0xFF)
+  };
+  byte result = CAN.sendMsgBuf(CAN_ID, 0, 4, buf);
+  Serial.print("RF← X="); Serial.print(data.x);
+  Serial.print("  Y="); Serial.print(data.y);
+  Serial.println(result == CAN_OK ? "  → CAN OK" : "  → CAN FAIL");
+}
