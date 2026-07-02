@@ -1,1 +1,461 @@
+/* ================================================================
+ *  AEB PERCEPTION ECU + EDR — Arduino Mega 2560
+ *  Hardware : Mega + LIDAR-Lite v3HP (I2C) + HC-SR04 + MCP2515
+ *  Library  : MCP_CAN by coryjfowler
+ *
+ *  NEW — EDR (Event Data Recorder), internal EEPROM, no SD card
+ *    10 pre-crash + 1 trigger + 10 post-crash frames @ 20 Hz
+ *    Trigger  : fused_mm transitions below 250 mm (EMERGENCY zone onset)
+ *    Storage  : 21 frames × 12 bytes = 252 bytes  (of 4096 EEPROM available)
+ *    Readback : connect USB after test, open Serial Monitor 115200 baud
+ *               send 'D' → CSV dump   |   send 'R' → clear + re-arm
+ *
+ *  Transmits on same CAN bus as Uno and STM32:
+ *    ID 0x050  Heartbeat  1 byte  0xA5   every 30 ms
+ *    ID 0x200  AEB telem  8 bytes        every 40 ms
+ *
+ *  CAN frame 0x200:
+ *    Byte 0-1  Fused distance mm  (uint16 big-endian)
+ *    Byte 2-3  Raw LIDAR mm
+ *    Byte 4-5  Raw Ultrasonic mm
+ *    Byte 6    Status  Bit0=LIDAR_OK  Bit1=US_OK  Bit2=DEGRADED
+ *    Byte 7    Rolling counter 0-255
+ *
+ *  MCP2515 : CS=D10  SCK=D52  SI=D51  SO=D50
+ *  LIDAR   : SDA=D20  SCL=D21
+ *  HC-SR04 : TRIG=D9  ECHO=D8
+ * ================================================================ */
 
+#include <Wire.h>
+#include <SPI.h>
+#include <mcp_can.h>
+#include <EEPROM.h>
+
+MCP_CAN CAN(10);
+
+const long CAN_HB_ID  = 0x050;
+const long CAN_AEB_ID = 0x200;
+
+#define LIDAR_ADDR       0x62
+#define TRIG_PIN         9
+#define ECHO_PIN         8
+
+#define LIDAR_MIN_MM     50
+#define LIDAR_MAX_MM   10000
+#define ULTRA_MIN_MM     20
+#define ULTRA_MAX_MM   4000
+#define ZONE_NEAR_MAX   250
+#define ZONE_MID_MAX   1000
+#define DISAGREEMENT_MM 300
+#define FAULT_FRAMES      5
+
+// EMERGENCY zone threshold — mirrors STM32 zone logic
+#define EMERG_THRESHOLD_MM  250
+
+int  disagreementCount = 0;
+bool fusionDegraded    = false;
+
+#define FILTER_SIZE 5
+int  filterBuf[FILTER_SIZE];
+int  filterIdx  = 0;
+long filterSum  = 0;
+bool filterReady = false;
+
+unsigned long lastHBTx  = 0;
+unsigned long lastTelTx = 0;
+uint8_t       rollingCtr = 0;
+
+// ================================================================
+//  EDR — Event Data Recorder  (Internal EEPROM, no SD card)
+
+//
+//  Frame layout  : 10 PRE  +  1 TRIGGER  +  10 POST  =  21 frames
+//  Frame size    : 12 bytes (packed struct, no padding on AVR)
+//  EEPROM used   : 2 header bytes + 252 data bytes = 254 bytes total
+//
+//  EEPROM address map:
+//    [0]        0xED = valid data   /   0xFF = empty
+//    [1]        number of frames written (0–21)
+//    [2–253]    frame array (21 × 12 bytes)
+//
+//  Write timing:
+//    252 bytes × 3.3 ms/byte ≈ 832 ms worst-case.
+//    A heartbeat (0xA5 on CAN 0x050) is injected after writing each
+//    frame (~40 ms per frame). This keeps the STM32 80 ms watchdog
+//    alive throughout the entire EEPROM write sequence.
+//
+//  Post-test readback (Serial 115200 baud, USB connected):
+//    'D' or 'd'  →  dump all frames as CSV to Serial Monitor
+//    'R' or 'r'  →  clear EEPROM, re-arm EDR for next test
+// ================================================================
+
+// ── Frame struct — 12 bytes on AVR ───────────────────────────────
+typedef struct {
+    uint32_t timestamp_ms;   // millis() at capture time
+    int16_t  lidar_mm;       // LIDAR-Lite v3HP raw reading (mm)
+    int16_t  sonar_mm;       // HC-SR04 raw reading (mm)
+    int16_t  fused_mm;       // weighted sensor fusion output (mm)
+    uint8_t  sensor_status;  // Bit0=LIDAR_OK  Bit1=US_OK  Bit2=DEGRADED
+    uint8_t  phase;          // 0 = PRE   1 = TRIGGER   2 = POST
+} EDR_Frame_t;
+
+// ── Sizing constants ─────────────────────────────────────────────
+#define EDR_PRE_COUNT    10
+#define EDR_POST_COUNT   10
+// edr_post[] holds the TRIGGER frame (slot 0) + 10 POST frames (slots 1-10)
+#define EDR_POST_SLOTS   (EDR_POST_COUNT + 1)       // 11
+#define EDR_TOTAL_FRAMES (EDR_PRE_COUNT + EDR_POST_SLOTS)  // 21
+#define EDR_FRAME_SIZE   ((uint8_t)sizeof(EDR_Frame_t))    // 12
+#define EDR_SAMPLE_MS    50   // 20 Hz sampling rate
+
+// ── EEPROM address constants ─────────────────────────────────────
+#define EDR_ADDR_MARKER  0          // valid marker byte
+#define EDR_ADDR_COUNT   1          // number of frames stored
+#define EDR_ADDR_DATA    2          // first frame starts here
+#define EDR_VALID_MARKER 0xED
+
+// ── SRAM buffers ─────────────────────────────────────────────────
+static EDR_Frame_t edr_ring[EDR_PRE_COUNT];     // rolling pre-crash ring
+static uint8_t     edr_ring_head  = 0;           // next write slot in ring
+static uint8_t     edr_ring_count = 0;           // frames filled (caps at PRE_COUNT)
+
+static EDR_Frame_t edr_post[EDR_POST_SLOTS];    // trigger + post capture
+static uint8_t     edr_post_count = 0;
+
+// ── EDR state machine ────────────────────────────────────────────
+typedef enum {
+    EDR_IDLE,      // recording pre-crash ring buffer continuously
+    EDR_TRIGGERED, // EMERGENCY detected — collecting post-crash frames
+    EDR_SAVED      // all 21 frames written to EEPROM
+} EDR_State_t;
+
+static EDR_State_t edr_state     = EDR_IDLE;
+static uint32_t    edr_last_ms   = 0;       // rate-limiter timestamp
+static bool        edr_was_emerg = false;   // previous emergency state (edge detect)
+
+// ── Private: fill one EDR frame ──────────────────────────────────
+static void edr_pack(EDR_Frame_t *f, int lidar, int sonar,
+                     int fused, uint8_t status, uint8_t phase) {
+    f->timestamp_ms  = millis();
+    f->lidar_mm      = (int16_t)constrain(lidar, -32768, 32767);
+    f->sonar_mm      = (int16_t)constrain(sonar, -32768, 32767);
+    f->fused_mm      = (int16_t)constrain(fused, -32768, 32767);
+    f->sensor_status = status;
+    f->phase         = phase;
+}
+
+// ── Private: write all frames to EEPROM with HB injection ────────
+// Assembles pre-crash ring + trigger + post-crash into a flat array,
+// then writes byte-by-byte. HB injected after each frame write
+// (~40 ms apart) — keeps STM32 watchdog (80 ms threshold) alive.
+static void edr_flush() {
+    // Build ordered array: oldest PRE frame first, then TRIGGER+POST
+    EDR_Frame_t all[EDR_TOTAL_FRAMES];
+    uint8_t idx = 0;
+
+    // Un-rotate the ring buffer — oldest entry sits at edr_ring_head
+    // when buffer is full, or at index 0 when not yet full.
+    uint8_t start = (edr_ring_count < EDR_PRE_COUNT) ? 0 : edr_ring_head;
+    for (uint8_t i = 0; i < edr_ring_count; i++)
+        all[idx++] = edr_ring[(start + i) % EDR_PRE_COUNT];
+
+    // Append trigger + post frames
+    for (uint8_t i = 0; i < edr_post_count; i++)
+        all[idx++] = edr_post[i];
+
+    uint8_t total = idx;
+
+    // Write header bytes
+    EEPROM.update(EDR_ADDR_MARKER, EDR_VALID_MARKER);
+    EEPROM.update(EDR_ADDR_COUNT,  total);
+
+    // Write frames one byte at a time; inject HB between each frame
+    int addr = EDR_ADDR_DATA;
+    for (uint8_t i = 0; i < total; i++) {
+        const uint8_t *p = (const uint8_t *)&all[i];
+        for (uint8_t b = 0; b < EDR_FRAME_SIZE; b++)
+            EEPROM.update(addr++, p[b]);
+
+        // HB injection after each 12-byte frame write (~40 ms elapsed).
+        // EEPROM.update() skips the write if the byte is unchanged,
+        // but still costs ~3.3 ms per changed byte.
+        // With HB firing every ~40 ms, worst-case HB gap is 40 ms
+        // which is well under the 80 ms STM32 watchdog threshold.
+        if (millis() - lastHBTx >= 30) {
+            byte hb[1] = {0xA5};
+            CAN.sendMsgBuf(CAN_HB_ID, 0, 1, hb);
+            lastHBTx = millis();
+        }
+    }
+
+    edr_state = EDR_SAVED;
+    Serial.print(F("[EDR] Write complete — "));
+    Serial.print(total);
+    Serial.print(F(" frames, "));
+    Serial.print((int)total * EDR_FRAME_SIZE);
+    Serial.println(F(" bytes. Connect USB → send 'D' to dump."));
+}
+
+// ── Public: edr_sample() — call every loop iteration ─────────────
+// Internally rate-limited to EDR_SAMPLE_MS (20 Hz).
+// Handles all three phases: PRE ring rolling, TRIGGER detection,
+// and POST capture. Calls edr_flush() automatically when POST is full.
+//
+// Parameters:
+//   lidar     — raw LIDAR reading (mm), -1 if invalid
+//   sonar     — raw HC-SR04 reading (mm), -1 if invalid
+//   fused     — filtered fusion output (mm), 0 if both sensors failed
+//   status    — sensor status byte (same as CAN 0x200 byte 6)
+//   is_emerg  — true when fused > 0 AND fused < EMERG_THRESHOLD_MM
+void edr_sample(int lidar, int sonar, int fused,
+                uint8_t status, bool is_emerg) {
+
+    if (edr_state == EDR_SAVED) return;   // nothing to do after save
+
+    uint32_t now = millis();
+    if ((now - edr_last_ms) < EDR_SAMPLE_MS) return;
+    edr_last_ms = now;
+
+    if (edr_state == EDR_IDLE) {
+        // Always roll the pre-crash ring buffer
+        edr_pack(&edr_ring[edr_ring_head], lidar, sonar, fused, status, 0);
+        edr_ring_head = (edr_ring_head + 1) % EDR_PRE_COUNT;
+        if (edr_ring_count < EDR_PRE_COUNT) edr_ring_count++;
+
+        // Detect rising edge into EMERGENCY zone
+        if (is_emerg && !edr_was_emerg) {
+            edr_state = EDR_TRIGGERED;
+            // Slot 0 in post buffer = TRIGGER frame (phase 1)
+            edr_pack(&edr_post[edr_post_count++], lidar, sonar, fused, status, 1);
+            Serial.println(F("[EDR] CRASH TRIGGER — capturing post-crash frames..."));
+        }
+        edr_was_emerg = is_emerg;
+
+    } else if (edr_state == EDR_TRIGGERED) {
+        // Slots 1-10 = POST frames (phase 2)
+        if (edr_post_count < EDR_POST_SLOTS) {
+            edr_pack(&edr_post[edr_post_count++], lidar, sonar, fused, status, 2);
+        }
+        // Full when: 1 TRIGGER + 10 POST = 11 frames in post buffer
+        if (edr_post_count >= EDR_POST_SLOTS) {
+            edr_flush();
+        }
+    }
+}
+
+// ── Public: edr_dump_serial() — print CSV to Serial ──────────────
+// Call after test run when USB is connected.
+// Serial Monitor → send 'D'. Copy output into a .csv file.
+void edr_dump_serial() {
+    if (EEPROM.read(EDR_ADDR_MARKER) != EDR_VALID_MARKER) {
+        Serial.println(F("[EDR] No crash log in EEPROM. Run a test first."));
+        return;
+    }
+    uint8_t count = EEPROM.read(EDR_ADDR_COUNT);
+    Serial.println(F("===== EDR CRASH LOG ====="));
+    Serial.println(F("phase,timestamp_ms,lidar_mm,sonar_mm,fused_mm,sensor_status"));
+
+    int addr = EDR_ADDR_DATA;
+    for (uint8_t i = 0; i < count; i++) {
+        EDR_Frame_t f;
+        uint8_t *p = (uint8_t *)&f;
+        for (uint8_t b = 0; b < EDR_FRAME_SIZE; b++)
+            p[b] = EEPROM.read(addr++);
+
+        const char *ph = (f.phase == 0) ? "PRE" :
+                         (f.phase == 1) ? "TRIGGER" : "POST";
+
+        Serial.print(ph);               Serial.print(',');
+        Serial.print(f.timestamp_ms);   Serial.print(',');
+        Serial.print(f.lidar_mm);       Serial.print(',');
+        Serial.print(f.sonar_mm);       Serial.print(',');
+        Serial.print(f.fused_mm);       Serial.print(',');
+        Serial.println(f.sensor_status, BIN);
+    }
+    Serial.println(F("===== END OF LOG ====="));
+}
+
+// ── Public: edr_reset() — clear EEPROM, re-arm ───────────────────
+// Call between test runs: send 'R' over Serial.
+void edr_reset() {
+    EEPROM.update(EDR_ADDR_MARKER, 0xFF);
+    EEPROM.update(EDR_ADDR_COUNT,  0);
+    memset(edr_ring, 0, sizeof(edr_ring));
+    memset(edr_post, 0, sizeof(edr_post));
+    edr_ring_head  = 0;
+    edr_ring_count = 0;
+    edr_post_count = 0;
+    edr_state      = EDR_IDLE;
+    edr_was_emerg  = false;
+    Serial.println(F("[EDR] Cleared. Armed for next test."));
+}
+
+// ================================================================
+//  SENSOR + FUSION — original Mega code, unchanged
+// ================================================================
+
+void lidarTrigger() {
+    Wire.beginTransmission(LIDAR_ADDR);
+    Wire.write(0x00); Wire.write(0x04);
+    Wire.endTransmission();
+}
+
+bool lidarReady(uint16_t ms = 80) {
+    // HB-PRIORITY NOTE: LIDAR polling can block up to ~ms milliseconds.
+    // Heartbeat is injected inside this loop whenever 30 ms have elapsed.
+    // This makes heartbeat TX the highest-priority task inside the poll window.
+    unsigned long t = millis();
+    while (millis() - t < ms) {
+        Wire.beginTransmission(LIDAR_ADDR); Wire.write(0x01); Wire.endTransmission(false);
+        Wire.requestFrom(LIDAR_ADDR, 1);
+        if (Wire.available() && !(Wire.read() & 0x01)) return true;
+        if (millis() - lastHBTx >= 30) {
+            byte hb[1] = {0xA5};
+            CAN.sendMsgBuf(CAN_HB_ID, 0, 1, hb);
+            lastHBTx = millis();
+        }
+        delayMicroseconds(500);
+    }
+    return false;
+}
+
+int lidarReadMM() {
+    Wire.beginTransmission(LIDAR_ADDR); Wire.write(0x0F | 0x80); Wire.endTransmission(false);
+    Wire.requestFrom(LIDAR_ADDR, 2);
+    if (Wire.available() >= 2) {
+        uint8_t h = Wire.read(), l = Wire.read();
+        return (int)(((h << 8) | l) * 10);
+    }
+    return -1;
+}
+
+int ultraReadMM() {
+    digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+    long d = pulseIn(ECHO_PIN, HIGH, 30000UL);
+    return d == 0 ? -1 : (int)(d * 0.1715f);
+}
+
+bool lValid(int d) { return d >= LIDAR_MIN_MM && d <= LIDAR_MAX_MM; }
+bool uValid(int d) { return d >= ULTRA_MIN_MM && d <= ULTRA_MAX_MM; }
+
+int weightedFuse(int lidar, int ultra) {
+    bool lv = lValid(lidar), uv = uValid(ultra);
+    if (!lv && !uv) { fusionDegraded = true; disagreementCount = 0; return 0; }
+    if (lv && !uv)  { fusionDegraded = true; disagreementCount = 0; return lidar; }
+    if (!lv && uv)  { fusionDegraded = true; disagreementCount = 0; return ultra; }
+    if (abs(lidar - ultra) > DISAGREEMENT_MM) {
+        if (++disagreementCount >= FAULT_FRAMES) fusionDegraded = true;
+        return min(lidar, ultra);
+    }
+    disagreementCount = 0; fusionDegraded = false;
+    int r = min(lidar, ultra);
+    int wL = (r < ZONE_NEAR_MAX) ? 25 : (r <= ZONE_MID_MAX) ? 60 : 90;
+    return (int)((long)(wL * lidar + (100 - wL) * ultra) / 100L);
+}
+
+void filterInit(int v) {
+    for (int i = 0; i < FILTER_SIZE; i++) filterBuf[i] = v;
+    filterSum = (long)v * FILTER_SIZE; filterReady = true;
+}
+
+int filterApply(int v) {
+    filterSum -= filterBuf[filterIdx];
+    filterBuf[filterIdx] = v;
+    filterSum += v;
+    filterIdx = (filterIdx + 1) % FILTER_SIZE;
+    return (int)(filterSum / FILTER_SIZE);
+}
+
+void sendHeartbeat() {
+    if (millis() - lastHBTx < 30) return;
+    lastHBTx = millis();
+    byte d[1] = {0xA5};
+    CAN.sendMsgBuf(CAN_HB_ID, 0, 1, d);
+}
+
+void sendTelemetry(int fused, int lidar, int ultra, uint8_t status) {
+    if (millis() - lastTelTx < 40) return;
+    lastTelTx = millis();
+    uint16_t pF = (uint16_t)max(0, fused);
+    uint16_t pL = (uint16_t)max(0, lidar);
+    uint16_t pU = (uint16_t)max(0, ultra);
+    byte f[8] = {
+        highByte(pF), lowByte(pF),
+        highByte(pL), lowByte(pL),
+        highByte(pU), lowByte(pU),
+        status, rollingCtr++
+    };
+    CAN.sendMsgBuf(CAN_AEB_ID, 0, 8, f);
+}
+
+// ================================================================
+//  SETUP
+// ================================================================
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    digitalWrite(TRIG_PIN, LOW);
+    pinMode(10, OUTPUT);
+    digitalWrite(10, HIGH);
+
+    while (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+        Serial.println("CAN init failed..."); delay(200);
+    }
+    CAN.setMode(MCP_NORMAL);
+
+    // EDR startup check — alert if a previous crash log is still in EEPROM
+    if (EEPROM.read(EDR_ADDR_MARKER) == EDR_VALID_MARKER) {
+        Serial.println(F("[EDR] !! Unread crash log found in EEPROM."));
+        Serial.println(F("[EDR]    Send 'D' to dump CSV  |  'R' to clear + re-arm."));
+    } else {
+        Serial.println(F("[EDR] Armed. Trigger: fused_mm < 250."));
+    }
+
+    Serial.println("AEB Perception ECU + EDR ready. TX 0x050 HB + 0x200 AEB.");
+}
+
+// ================================================================
+//  LOOP
+// ================================================================
+
+void loop() {
+    sendHeartbeat();
+
+    lidarTrigger();
+    int rawL = lidarReady() ? lidarReadMM() : -1;
+
+    sendHeartbeat();
+
+    int rawU  = ultraReadMM();
+    int fused = weightedFuse(rawL, rawU);
+    if (fused < 0) fused = 0;
+
+    if (!filterReady && fused > 0) filterInit(fused);
+    int final_d = filterReady ? filterApply(fused) : fused;
+    if (final_d < 0) final_d = 0;
+
+    uint8_t status = 0;
+    if (lValid(rawL))    status |= 0x01;
+    if (uValid(rawU))    status |= 0x02;
+    if (fusionDegraded)  status |= 0x04;
+
+    sendTelemetry(final_d, max(0, rawL), max(0, rawU), status);
+
+    // ── EDR sample ─────────────────────────────────────────────────
+    // is_emerg: only true when fused > 0 (both sensors not failed)
+    // AND distance is below EMERGENCY threshold.
+    // A fused value of 0 means sensor failure — do not trigger EDR.
+    bool is_emerg = (final_d > 0) && (final_d < EMERG_THRESHOLD_MM);
+    edr_sample(rawL, rawU, final_d, status, is_emerg);
+
+    // ── Serial command handler (post-test, USB connected) ──────────
+    if (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'D' || c == 'd') edr_dump_serial();
+        if (c == 'R' || c == 'r') edr_reset();
+    }
+}
