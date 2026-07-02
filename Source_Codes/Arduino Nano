@@ -1,1 +1,44 @@
+/* ================================================================
+ *  TRANSMITTER — Arduino Nano
+ *  Hardware : Arduino Nano + HW504 Joystick + nRF24L01
+ *  Library  : RF24 by TMRh20  (install via Library Manager)
+ *  UNCHANGED from original system
+ * ================================================================ */
 
+#include <SPI.h>
+#include <RF24.h>
+
+// nRF24L01: CE=D9, CSN=D10 (hardware SPI on D11/D12/D13)
+RF24 radio(9, 10);
+
+const byte ADDR[6] = "MOTOR";   // Must match Uno receiver
+
+struct JoyData {
+  uint16_t x;     // VRx analog value (0–1023)
+  uint16_t y;     // VRy analog value (0–1023)
+};
+
+void setup() {
+  Serial.begin(9600);
+  if (!radio.begin()) {
+    Serial.println("ERROR: nRF24L01 not detected! Check wiring.");
+    while (true);
+  }
+  radio.setChannel(76);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.openWritingPipe(ADDR);
+  radio.stopListening();
+  Serial.println("Transmitter ready.");
+}
+
+void loop() {
+  JoyData data;
+  data.x = analogRead(A0);
+  data.y = analogRead(A1);
+  bool ok = radio.write(&data, sizeof(data));
+  Serial.print("X: "); Serial.print(data.x);
+  Serial.print("  Y: "); Serial.print(data.y);
+  Serial.println(ok ? "  [SENT OK]" : "  [SEND FAILED]");
+  delay(20);
+}
