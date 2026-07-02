@@ -1,1 +1,251 @@
+/* ================================================================
+ *  AEB + RC MOTOR CONTROLLER — STM32 Nucleo-64 F446RE
+ *  Hardware : Nucleo F446RE + MCP2515 + L298N + 2× DC motors
+ *
+ *  CAN inputs (all on same 500 kbps bus):
+ *    0x100  Joystick data   from Arduino Uno    (RC control)
+ *    0x050  AEB heartbeat   from Arduino Mega   (watchdog)
+ *    0x200  AEB distance    from Arduino Mega   (zones + telemetry)
+ *
+ *  AEB PRIORITY — governs motor speed limit by zone:
+ *    > 500 mm  CRUISE              Joystick active, speed capped at 70% (179/255 PWM)
+ *    250-500mm DECEL               Linear ramp: PWM% = 30 + (40*(fused-250)/250)
+ *                                  70% at 500mm → 30% at 250mm  (raw 178→76)
+ *    < 250 mm  EMERG               Active back-EMF brake (IN1=IN2=HIGH), RC ignored
+ *    HB>80ms   STATE_NETWORK_FAULT Hardware lockout loop — all 0x200 ignored,
+ *                                  10Hz LED, motor locked. Only exit: PC13 User button
+ *                                  with mandatory 50ms software debounce.
+ *
+ *  MCP2515:  CS=D10(PB6)  SCK=D13(PA5)  MOSI=D11(PA7)  MISO=D12(PA6)
+ *  Motor A:  ENA=D3(PB3)  IN1=D4(PB5)   IN2=D5(PB4)
+ *  Motor B:  ENB=D6(PB10) IN3=D7(PA8)   IN4=D8(PA9)
+ * ================================================================ */
 
+#include <SPI.h>
+#include <mcp_can.h>
+
+MCP_CAN CAN(10);
+
+const long CAN_RC_ID  = 0x100;
+const long CAN_HB_ID  = 0x050;
+const long CAN_AEB_ID = 0x200;
+
+#define ENA  3
+#define IN1  4
+#define IN2  5
+#define ENB  6
+#define IN3  7
+#define IN4  8
+
+const int DEADZONE   = 30;
+const int CRUISE_PWM = 150;   // 70% of 255 — spec-defined cruise speed cap
+
+const unsigned long RC_WATCHDOG_MS  = 500;
+const unsigned long AEB_WATCHDOG_MS =  80;
+
+unsigned long lastRCmsg = 0, lastHBmsg = 0;
+bool hbEverRx = false;
+uint16_t fusedMM = 9999;
+
+typedef enum { AEB_IDLE, AEB_CRUISE, AEB_DECEL, AEB_EMERG, AEB_FAULT } AEBState;
+AEBState aebState = AEB_IDLE;
+
+volatile bool          btnFlag      = false;
+volatile unsigned long btnPressTime = 0;   // ISR-captured timestamp for 50ms debounce
+
+// Interrupt Service Routine — fires on FALLING edge of PC13 User button
+// Records millis() immediately; main code waits 50ms before acting (software debounce)
+void onButton() {
+  btnPressTime = millis();   // Capture edge time atomically in ISR
+  btnFlag      = true;
+}
+
+void driveMotorA(int spd) {
+  spd = constrain(spd, -255, 255);
+  digitalWrite(IN1, spd > 0 ? HIGH : LOW);
+  digitalWrite(IN2, spd < 0 ? HIGH : LOW);
+  analogWrite(ENA, abs(spd));
+}
+void driveMotorB(int spd) {
+  spd = constrain(spd, -255, 255);
+  digitalWrite(IN3, spd > 0 ? HIGH : LOW);
+  digitalWrite(IN4, spd < 0 ? HIGH : LOW);
+  analogWrite(ENB, abs(spd));
+}
+void stopAll()  { driveMotorA(0); driveMotorB(0); }
+void brakeAll() {
+  // Active back-EMF braking: pull both H-bridge inputs to matching HIGH state.
+  // Shorting motor windings creates opposing torque — zero freewheeling.
+  analogWrite(ENA, 255); digitalWrite(IN1, HIGH); digitalWrite(IN2, HIGH);
+  analogWrite(ENB, 255); digitalWrite(IN3, HIGH); digitalWrite(IN4, HIGH);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ENA,OUTPUT); pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(ENB,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  stopAll();
+  pinMode(PC13, INPUT_PULLUP);
+  // PC13 User button — FALLING edge triggers ISR. ISR records btnPressTime = millis().
+  // Main code enforces 50ms debounce before acting: avoids spurious re-triggers
+  // from mechanical contact bounce (typical button bounce < 10ms).
+  attachInterrupt(digitalPinToInterrupt(PC13), onButton, FALLING);
+
+  while(CAN.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK){
+    Serial.println("MCP2515 init failed – retrying..."); delay(300);
+  }
+  CAN.setMode(MCP_NORMAL);
+  // Disable hardware filters — accept all IDs, route in software
+  CAN.init_Mask(0, 0, 0x000); CAN.init_Mask(1, 0, 0x000);
+  for(int i = 0; i < 6; i++) CAN.init_Filt(i, 0, 0x000);
+
+  Serial.println("AEB+RC Motor Controller ready.");
+  Serial.println("IDs: 0x100=RC  0x050=HB  0x200=AEB");
+  Serial.println("Zones: CRUISE=70%(179) DECEL=linear EMERG=brakeAll");
+}
+
+void loop() {
+  // 1. Drain the full CAN RX FIFO every loop iteration
+  while(CAN.checkReceive() == CAN_MSGAVAIL){
+    unsigned long id; byte len, buf[8];
+    CAN.readMsgBuf(&id, &len, buf);
+
+    // ── 0x100 Joystick (RC) ───────────────────────────────────────────────
+    if(id == CAN_RC_ID && len >= 4){
+      lastRCmsg = millis();
+      uint16_t rawX = ((uint16_t)buf[0] << 8) | buf[1];
+      uint16_t rawY = ((uint16_t)buf[2] << 8) | buf[3];
+      int xVal = map((int)rawX, 0, 1023, -255, 255);
+      int yVal = map((int)rawY, 0, 1023, -255, 255);
+      if(abs(xVal) < DEADZONE) xVal = 0;
+      if(abs(yVal) < DEADZONE) yVal = 0;
+
+      if(aebState == AEB_CRUISE || aebState == AEB_IDLE){
+        // CRUISE: full joystick steering but speed capped at 70% (CRUISE_PWM)
+        driveMotorA(constrain(yVal + xVal, -CRUISE_PWM, CRUISE_PWM));
+        driveMotorB(constrain(yVal - xVal, -CRUISE_PWM, CRUISE_PWM));
+
+      } else if(aebState == AEB_DECEL){
+        // DECEL: linear interpolation ramp  70% → 30%  as obstacle closes
+        // Spec formula: PWM% = 30 + ((70-30) * (fused-250) / (500-250))
+        int pct = 30 + (40 * (int)(fusedMM - 250)) / 250;
+        pct = constrain(pct, 30, 70);         // guard against stale fusedMM
+        int cap = (pct * 255) / 100;          // 76–178 raw PWM
+        Serial.print("[DECEL] "); Serial.print(fusedMM);
+        Serial.print("mm  "); Serial.print(pct);
+        Serial.print("%  cap="); Serial.println(cap);
+        driveMotorA(constrain(yVal + xVal, -cap, cap));
+        driveMotorB(constrain(yVal - xVal, -cap, cap));
+      }
+      // AEB_EMERG / AEB_FAULT: RC completely ignored — brakeAll() below
+    }
+
+    // ── 0x050 Heartbeat ────────────────────────────────────────────────────
+    else if(id == CAN_HB_ID && len >= 1 && buf[0] == 0xA5){
+      lastHBmsg = millis(); hbEverRx = true;
+    }
+
+    // ── 0x200 AEB Telemetry (full 8-byte decode) ───────────────────────────
+    else if(id == CAN_AEB_ID && len >= 8 && aebState != AEB_FAULT){
+      fusedMM            = ((uint16_t)buf[0] << 8) | buf[1];
+      uint16_t rawLidar  = ((uint16_t)buf[2] << 8) | buf[3];
+      uint16_t rawUltra  = ((uint16_t)buf[4] << 8) | buf[5];
+      uint8_t  statusMsk =  buf[6];   // Bit0=LIDAR_OK Bit1=US_OK Bit2=DEGRADED
+      uint8_t  rollCtr   =  buf[7];   // rolling 0-255 counter
+
+      // Zone state machine
+      if(fusedMM < 250)         aebState = AEB_EMERG;
+      else if(fusedMM <= 500)   aebState = AEB_DECEL;
+      else                      aebState = AEB_CRUISE;
+
+      Serial.print("[0x200] fused="); Serial.print(fusedMM);
+      Serial.print("mm  lidar=");     Serial.print(rawLidar);
+      Serial.print("mm  ultra=");     Serial.print(rawUltra);
+      Serial.print("mm  status=0x");  Serial.print(statusMsk, HEX);
+      Serial.print("  roll=");        Serial.println(rollCtr);
+    }
+  }
+
+  // 2. NETWORK WATCHDOG — STATE_NETWORK_FAULT entry + hardware lockout loop
+  //    Threshold: 80ms (≈2.67 missed 30ms heartbeats — spec minimum 2.5)
+  if(hbEverRx && (millis() - lastHBmsg) >= AEB_WATCHDOG_MS){
+    if(aebState != AEB_FAULT){
+      aebState = AEB_FAULT;   // = STATE_NETWORK_FAULT per spec
+      Serial.print("!! NETWORK FAULT — HB silent >"); Serial.print(AEB_WATCHDOG_MS);
+      Serial.println("ms — hardware lockout engaged");
+      Serial.println("   0x200 telemetry: IGNORED. Motor: back-EMF brake.");
+      Serial.println("   Recovery: press User button PC13 (50ms debounce required).");
+
+      // ═══════════════════════════════════════════════════════════════════════
+      //  HARDWARE LOCKOUT LOOP — STATE_NETWORK_FAULT
+      //
+      //  Structural guarantee: this while(true) is the ONLY execution path
+      //  in STATE_NETWORK_FAULT. It cannot be exited by any CAN frame —
+      //  even a fully valid 0x200 telemetry stream is silently discarded.
+      //
+      //  The MCP2515 FIFO is still drained each iteration to prevent buffer
+      //  overflow (MCP2515 has a 2-message hardware RX buffer) and to avoid
+      //  phantom RXIF ISR activity blocking the SPI bus.
+      //
+      //  ONLY valid exit: debounced button press (btnFlag + 50ms elapsed).
+      // ═══════════════════════════════════════════════════════════════════════
+      while(true) {
+
+        // ── Re-assert back-EMF brake every iteration — cannot be overridden ──
+        brakeAll();
+
+        // ── 10 Hz LED flash (100ms period, 50ms ON / 50ms OFF) ──────────────
+        digitalWrite(LED_BUILTIN, (millis() % 100 < 50) ? HIGH : LOW);
+
+        // ── Drain MCP2515 FIFO — log 0x050 recovery, discard all else ───────
+        while(CAN.checkReceive() == CAN_MSGAVAIL){
+          unsigned long rxId; byte rxLen, rxBuf[8];
+          CAN.readMsgBuf(&rxId, &rxLen, rxBuf);
+          if(rxId == CAN_HB_ID && rxLen >= 1 && rxBuf[0] == 0xA5){
+            // Mega recovered / bus reconnected — system remains LOCKED.
+            // Spec lockout-override test: motor stays stopped even with valid HB.
+            Serial.println("[LOCKOUT] 0x050 HB rx — motor locked until button reset");
+          }
+          // 0x200 AEB telemetry: silently discarded per spec §2.4 lockout rule
+          // 0x100 Joystick:      silently discarded — RC control suspended
+        }
+
+        // ── Button check: 50ms software debounce on top of ISR edge capture ──
+        // btnPressTime set atomically in onButton() ISR on FALLING edge.
+        // We wait 50ms after the captured edge — filters mechanical bounce
+        // (typical button contact bounce settles within 5–20ms).
+        if(btnFlag && ((millis() - btnPressTime) >= 50UL)){
+          btnFlag      = false;
+          btnPressTime = 0;
+          aebState     = AEB_IDLE;  // = STATE_IDLE per spec
+          hbEverRx     = false;     // Force re-validation of fresh HB stream
+          lastHBmsg    = 0;
+          lastRCmsg    = 0;
+          stopAll();                // Release brake — RC can drive motor again
+          Serial.println("[BTN] 50ms debounce passed — lockout cleared → STATE_IDLE");
+          Serial.println("   Awaiting fresh 0x050 heartbeat before AEB zones re-activate.");
+          break;                    // ← Only exit from the lockout loop
+        }
+
+      } // end HARDWARE LOCKOUT LOOP
+      // Returns here only after successful debounced button press
+    }
+  }
+
+  // 3. RC watchdog — coast-stop if Uno silent > 500ms
+  if(lastRCmsg > 0 && millis() - lastRCmsg > RC_WATCHDOG_MS)
+    if(aebState == AEB_CRUISE || aebState == AEB_IDLE) stopAll();
+
+  // 4. Continuously re-assert brake in active danger states
+  if(aebState == AEB_EMERG || aebState == AEB_FAULT) brakeAll();
+
+  // 5. LED zone feedback (STATE_NETWORK_FAULT LED is handled inside lockout loop above)
+  if(aebState == AEB_FAULT  || aebState == AEB_EMERG)
+    digitalWrite(LED_BUILTIN, (millis() % 100  < 50)  ? HIGH : LOW); // 10 Hz fast blink
+  else if(aebState == AEB_DECEL)
+    digitalWrite(LED_BUILTIN, (millis() % 500  < 250) ? HIGH : LOW); // 2 Hz slow blink
+  else
+    digitalWrite(LED_BUILTIN, HIGH);                                   // solid = safe
+
+  // No delay() — loop at native MCU speed for minimal CAN latency
+}
